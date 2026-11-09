@@ -1,0 +1,17 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Build outputs
+/bin/
+
+# Go test and coverage artifacts
+*.test
+*.out
+coverage.*
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
