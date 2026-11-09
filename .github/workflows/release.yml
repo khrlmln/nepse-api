@@ -1,0 +1,339 @@
+name: CI and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  GO_VERSION_FILE: go.mod
+
+jobs:
+  verify:
+    name: Test and verify
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Verify module checksums
+        run: go mod verify
+
+      - name: Check Go formatting
+        run: make fmt-check
+
+      - name: Run static analysis
+        run: make vet
+
+      - name: Run complete test suite
+        run: make test
+
+      - name: Build native production binaries
+        run: make build
+
+      - name: Verify native binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s bin/nepse-rest
+          test -s bin/nepse-mcp
+
+          file bin/nepse-rest
+          file bin/nepse-mcp
+
+          echo "Native binaries verified successfully."
+
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    needs: verify
+
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            archive_format: tar.gz
+
+          - goos: linux
+            goarch: arm64
+            archive_format: tar.gz
+
+          - goos: windows
+            goarch: amd64
+            archive_format: zip
+
+          - goos: windows
+            goarch: arm64
+            archive_format: zip
+
+          - goos: darwin
+            goarch: amd64
+            archive_format: tar.gz
+
+          - goos: darwin
+            goarch: arm64
+            archive_format: tar.gz
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="snapshot-${GITHUB_SHA::12}"
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binaries
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ steps.version.outputs.version }}
+          COMMIT: ${{ github.sha }}
+
+        run: |
+          set -euo pipefail
+
+          rm -rf dist
+          mkdir -p dist/package
+
+          binary_suffix=""
+
+          if [[ "$GOOS" == "windows" ]]; then
+            binary_suffix=".exe"
+          fi
+
+          echo "Building release:"
+          echo "  Version: $VERSION"
+          echo "  Commit:  $COMMIT"
+          echo "  GOOS:    $GOOS"
+          echo "  GOARCH:  $GOARCH"
+
+          for service in rest mcp; do
+            echo "Building nepse-$service..."
+
+            CGO_ENABLED=0 \
+            GOOS="$GOOS" \
+            GOARCH="$GOARCH" \
+            go build \
+              -trimpath \
+              -ldflags="-s -w \
+                -X nepse-api/src/shared/version.Version=${VERSION} \
+                -X nepse-api/src/shared/version.Commit=${COMMIT} \
+                -X nepse-api/src/shared/version.BuildMode=production" \
+              -o "dist/package/nepse-${service}${binary_suffix}" \
+              "./src/cmd/${service}"
+          done
+
+          echo "Built binaries:"
+          ls -lh dist/package
+
+      - name: Verify release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ matrix.goos }}" == "windows" ]]; then
+            test -s dist/package/nepse-rest.exe
+            test -s dist/package/nepse-mcp.exe
+          else
+            test -s dist/package/nepse-rest
+            test -s dist/package/nepse-mcp
+          fi
+
+          file dist/package/*
+
+          echo "Release binaries verified successfully."
+
+      - name: Package release
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          ARCHIVE_FORMAT: ${{ matrix.archive_format }}
+
+        run: |
+          set -euo pipefail
+
+          archive="nepse-api_${VERSION}_${GOOS}_${GOARCH}.${ARCHIVE_FORMAT}"
+
+          if [[ "$ARCHIVE_FORMAT" == "zip" ]]; then
+            (
+              cd dist/package
+              zip -9 "../${archive}" *
+            )
+          else
+            tar \
+              -C dist/package \
+              -czf "dist/${archive}" \
+              .
+          fi
+
+          echo "Created archive:"
+          ls -lh "dist/${archive}"
+
+      - name: Generate SHA256 checksum
+        shell: bash
+        working-directory: dist
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          ARCHIVE_FORMAT: ${{ matrix.archive_format }}
+
+        run: |
+          set -euo pipefail
+
+          archive="nepse-api_${VERSION}_${GOOS}_${GOARCH}.${ARCHIVE_FORMAT}"
+
+          sha256sum "$archive" > "${archive}.sha256"
+
+          echo "Checksum:"
+          cat "${archive}.sha256"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s RELEASE_NOTE.md
+
+          echo "Release notes found:"
+          echo "----------------------------------------"
+          cat RELEASE_NOTE.md
+          echo "----------------------------------------"
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate combined SHA256SUMS
+        working-directory: dist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -f SHA256SUMS
+
+          for checksum in *.sha256; do
+            cat "$checksum"
+          done | sort > SHA256SUMS
+
+          echo "Generated SHA256SUMS:"
+          cat SHA256SUMS
+
+      - name: Verify release artifacts
+        working-directory: dist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for checksum in *.sha256; do
+            sha256sum --check "$checksum"
+          done
+
+          echo "All artifact checksums verified."
+
+      - name: List release files
+        working-directory: dist
+        run: |
+          ls -lah
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+
+        run: |
+          set -euo pipefail
+
+          gh release create "$TAG" \
+            dist/* \
+            --verify-tag \
+            --title "$TAG" \
+            --notes-file RELEASE_NOTE.md
